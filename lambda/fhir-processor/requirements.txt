@@ -1,0 +1,11 @@
+# FHIR R5 Python library
+fhir.resources>=7.1.0
+
+# Database
+PyMySQL>=1.1.0
+
+# SQL parsing
+sqlparse>=0.4.4
+
+# AWS SDK (provided by Lambda runtime, but included for local testing)
+boto3>=1.34.0

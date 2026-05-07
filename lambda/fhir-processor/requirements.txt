@@ -9,3 +9,6 @@ sqlparse>=0.4.4
 
 # AWS SDK (provided by Lambda runtime, but included for local testing)
 boto3>=1.34.0
+
+# Encryption for client-side encrypted dumps (pure Python)
+pyaes>=1.6.1

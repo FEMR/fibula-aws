@@ -1,0 +1,1 @@
+{"statusCode": 500, "body": "{\"error\": \"(1452, 'Cannot add or update a child row: a foreign key constraint fails (`femr_central`.`central_api_patientencounter`, CONSTRAINT `central_api_patiente_campaign_id_e2fc3549_fk_central_a` FOREIGN KEY (`campaign_id`) REFERENCES `central_api_missiontrip` (`id`))')\", \"message\": \"Failed to process SQL dump\"}"}

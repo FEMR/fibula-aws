@@ -1,0 +1,14 @@
+{
+    "Records":  [
+                    {
+                        "s3":  {
+                                   "bucket":  {
+                                                  "name":  "femr-kit-db-dumps-west"
+                                              },
+                                   "object":  {
+                                                  "key":  "kit-c6d1b990ad56/2026-04-07T20:10:41.821Z.sql.gz"
+                                              }
+                               }
+                    }
+                ]
+}

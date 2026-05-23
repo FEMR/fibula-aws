@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+# Ignore editor/temp files
+*.pyc
+thumbs.db
+archive/*.log

@@ -15,6 +15,8 @@ import json
 import os
 import re
 import sqlparse
+import base64
+import pyaes
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import logging
@@ -29,6 +31,7 @@ from fhir.resources.address import Address
 from fhir.resources.practitioner import Practitioner
 from fhir.resources.encounter import Encounter, EncounterParticipant
 from fhir.resources.observation import Observation, ObservationComponent
+from fhir.resources.condition import Condition
 from fhir.resources.medicationrequest import MedicationRequest
 from fhir.resources.medicationdispense import MedicationDispense
 from fhir.resources.documentreference import DocumentReference, DocumentReferenceContent
@@ -50,6 +53,7 @@ logger.setLevel(logging.INFO)
 
 # AWS clients
 s3 = boto3.client('s3')
+kms = boto3.client('kms')
 
 # Environment variables
 RDS_HOST = os.environ.get('RDS_HOST')
@@ -64,6 +68,7 @@ class SQLParser:
     
     def __init__(self, sql_content: str):
         self.sql_content = sql_content
+        self.table_columns = self._extract_table_columns(sql_content)
         self.parsed_data = {
             'patients': [],
             'encounters': [],
@@ -71,7 +76,8 @@ class SQLParser:
             'prescriptions': [],
             'diagnoses': [],
             'users': [],
-            'photos': []
+            'photos': [],
+            'mission_trips': []
         }
     
     def parse(self) -> Dict[str, List[Dict]]:
@@ -87,6 +93,33 @@ class SQLParser:
         
         logger.info(f"Parsed {len(self.parsed_data['encounters'])} encounters")
         return self.parsed_data
+
+    def _extract_table_columns(self, sql_content: str) -> Dict[str, List[str]]:
+        """Extract ordered column names from CREATE TABLE statements."""
+        table_columns: Dict[str, List[str]] = {}
+        create_table_pattern = re.compile(
+            r'CREATE TABLE\s+`?(\w+)`?\s*\((.*?)\)\s*ENGINE=',
+            re.IGNORECASE | re.DOTALL
+        )
+
+        for table_name, table_def in create_table_pattern.findall(sql_content):
+            columns: List[str] = []
+            for raw_line in table_def.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.upper().startswith((
+                    'PRIMARY KEY', 'UNIQUE KEY', 'KEY ', 'CONSTRAINT', 'INDEX ', 'FULLTEXT'
+                )):
+                    continue
+                column_match = re.match(r'`([^`]+)`\s+', line)
+                if column_match:
+                    columns.append(column_match.group(1))
+
+            if columns:
+                table_columns[table_name.lower()] = columns
+
+        return table_columns
     
     def _parse_insert_statement(self, statement: str):
         """Parse INSERT statement and extract ALL rows (handles multi-row VALUES)."""
@@ -99,10 +132,13 @@ class SQLParser:
 
         # Extract column names (everything between first '(' and 'VALUES')
         columns_match = re.search(r'\((.*?)\)\s+VALUES', statement, re.IGNORECASE | re.DOTALL)
-        if not columns_match:
-            return
-
-        columns = [col.strip('`" ') for col in columns_match.group(1).split(',')]
+        columns: List[str]
+        if columns_match:
+            columns = [col.strip('`" ') for col in columns_match.group(1).split(',')]
+        else:
+            columns = self.table_columns.get(table_name.lower(), [])
+            if not columns:
+                return
 
         # Find the VALUES section and extract EVERY row '(...)'
         values_section_match = re.search(r'VALUES\s*(.*)', statement, re.IGNORECASE | re.DOTALL)
@@ -114,6 +150,8 @@ class SQLParser:
         for row_str in all_rows:
             values = self._extract_values(row_str)
             if len(columns) != len(values):
+                if table_name.lower() == 'play_evolutions':
+                    continue
                 logger.warning(f"Column/value mismatch for table {table_name}: "
                                f"{len(columns)} cols vs {len(values)} values")
                 continue
@@ -122,9 +160,9 @@ class SQLParser:
 
             if table_name.lower() in ['patient', 'patients']:
                 self.parsed_data['patients'].append(row_data)
-            elif table_name.lower() in ['patientencounter', 'patient_encounter']:
+            elif table_name.lower() in ['patientencounter', 'patient_encounter', 'patient_encounters']:
                 self.parsed_data['encounters'].append(row_data)
-            elif table_name.lower() in ['patientencountervital', 'patient_encounter_vital']:
+            elif table_name.lower() in ['patientencountervital', 'patient_encounter_vital', 'patient_encounter_vitals']:
                 self.parsed_data['vitals'].append(row_data)
             elif table_name.lower() in ['patientprescriptions', 'patient_prescriptions']:
                 self.parsed_data['prescriptions'].append(row_data)
@@ -134,6 +172,8 @@ class SQLParser:
                 self.parsed_data['users'].append(row_data)
             elif table_name.lower() in ['photo', 'photos']:
                 self.parsed_data['photos'].append(row_data)
+            elif table_name.lower() in ['missiontrip', 'mission_trip', 'mission_trips']:
+                self.parsed_data['mission_trips'].append(row_data)
 
     def _extract_all_value_rows(self, values_section: str) -> List[str]:
         """
@@ -319,12 +359,16 @@ class FHIRTransformer:
         # 5. OBSERVATIONS (Vitals, Flags, etc.)
         observations = self._create_observations(encounter_id, encounter_data)
         entries.extend(observations)
+
+        # 6. CONDITIONS (Clinical findings / diagnoses)
+        conditions = self._create_conditions(encounter_id, patient_id, encounter_data)
+        entries.extend(conditions)
         
-        # 6. MEDICATION REQUEST & DISPENSE
+        # 7. MEDICATION REQUEST & DISPENSE
         medications = self._create_medication_resources(encounter_id)
         entries.extend(medications)
         
-        # 7. DOCUMENT REFERENCES (Photos)
+        # 8. DOCUMENT REFERENCES (Photos)
         documents = self._create_document_references(encounter_id)
         entries.extend(documents)
         
@@ -771,6 +815,150 @@ class FHIRTransformer:
                 system="http://unitsofmeasure.org"
             )
         )
+
+    def _create_conditions(self, encounter_id: int, patient_id: int, encounter_data: Dict) -> List[BundleEntry]:
+        """Create Condition resources for encounter clinical findings/diagnoses."""
+        entries: List[BundleEntry] = []
+
+        diagnosis_data = self._find_diagnoses_for_encounter(encounter_id, patient_id)
+        for index, diagnosis in enumerate(diagnosis_data, start=1):
+            diagnosis_id = diagnosis.get('legacy_id') or diagnosis.get('id') or f"enc-{encounter_id}-{index}"
+
+            diagnosis_text = (
+                diagnosis.get('text')
+                or diagnosis.get('diagnosis_text')
+                or diagnosis.get('description')
+                or diagnosis.get('name')
+                or diagnosis.get('value')
+            )
+
+            coding = None
+            if diagnosis.get('code'):
+                coding = Coding(
+                    system=diagnosis.get('system') or diagnosis.get('coding_system') or "http://hl7.org/fhir/sid/icd-10",
+                    code=str(diagnosis.get('code')),
+                    display=diagnosis_text
+                )
+
+            condition = Condition(
+                clinicalStatus=CodeableConcept(
+                    coding=[Coding(
+                        system="http://terminology.hl7.org/CodeSystem/condition-clinical",
+                        code="active",
+                        display="Active"
+                    )]
+                ),
+                verificationStatus=CodeableConcept(
+                    coding=[Coding(
+                        system="http://terminology.hl7.org/CodeSystem/condition-ver-status",
+                        code="confirmed",
+                        display="Confirmed"
+                    )]
+                ),
+                category=[CodeableConcept(
+                    coding=[Coding(
+                        system="http://terminology.hl7.org/CodeSystem/condition-category",
+                        code="encounter-diagnosis",
+                        display="Encounter Diagnosis"
+                    )]
+                )],
+                code=CodeableConcept(
+                    coding=[coding] if coding else None,
+                    text=diagnosis_text or "Clinical finding"
+                ),
+                subject=Reference(reference=f"urn:uuid:patient-{patient_id}"),
+                encounter=Reference(reference=f"urn:uuid:encounter-{encounter_id}"),
+                recordedDate=self._to_fhir_datetime(
+                    encounter_data.get('date_of_medical_visit')
+                    or encounter_data.get('date_of_triage_visit')
+                    or encounter_data.get('timestamp')
+                )
+            )
+
+            entries.append(BundleEntry(
+                fullUrl=f"urn:uuid:condition-{diagnosis_id}-{encounter_id}",
+                resource=condition
+            ))
+
+        return entries
+
+    def _find_diagnoses_for_encounter(self, encounter_id: int, patient_id: int) -> List[Dict]:
+        """Resolve diagnosis rows relevant to this encounter.
+
+        Supports both direct diagnosis rows (with text) and join-style rows
+        (encounter/patient/diagnosis_id references).
+        """
+        diagnosis_rows = self.data.get('diagnoses', [])
+        if not diagnosis_rows:
+            return []
+
+        encounter_keys = {'patientEncounterId', 'patient_encounter_id', 'encounter_id', 'patientencounter_id'}
+        patient_keys = {'patient_id', 'patientId'}
+        diagnosis_ref_keys = {'diagnosis_id', 'diagnosisId'}
+        text_keys = {'text', 'diagnosis_text', 'description', 'name', 'value'}
+
+        def _row_value(row: Dict, candidate_keys: set):
+            for key in candidate_keys:
+                if key in row and row.get(key) is not None:
+                    return row.get(key)
+            return None
+
+        diagnosis_lookup_by_id: Dict[str, Dict] = {}
+        for row in diagnosis_rows:
+            row_id = row.get('id') or row.get('legacy_id')
+            if row_id is not None and any(k in row and row.get(k) for k in text_keys):
+                diagnosis_lookup_by_id[str(row_id)] = row
+
+        resolved: List[Dict] = []
+        has_explicit_links = False
+
+        for row in diagnosis_rows:
+            row_encounter = _row_value(row, encounter_keys)
+            row_patient = _row_value(row, patient_keys)
+            row_diagnosis_id = _row_value(row, diagnosis_ref_keys)
+
+            if row_encounter is None and row_patient is None and row_diagnosis_id is None:
+                continue
+
+            has_explicit_links = True
+
+            encounter_match = row_encounter is not None and str(row_encounter) == str(encounter_id)
+            patient_match = row_patient is not None and str(row_patient) == str(patient_id)
+            if not (encounter_match or patient_match):
+                continue
+
+            if row_diagnosis_id is not None:
+                resolved_row = diagnosis_lookup_by_id.get(str(row_diagnosis_id))
+                if resolved_row:
+                    merged = dict(resolved_row)
+                    merged.update(row)
+                    resolved.append(merged)
+                else:
+                    resolved.append(row)
+            else:
+                resolved.append(row)
+
+        if not has_explicit_links:
+            fallback = [
+                row for row in diagnosis_rows
+                if any(k in row and row.get(k) for k in text_keys)
+            ]
+            return fallback
+
+        deduped: List[Dict] = []
+        seen = set()
+        for row in resolved:
+            key = (
+                str(row.get('legacy_id') or row.get('id') or ''),
+                str(row.get('diagnosis_id') or row.get('diagnosisId') or ''),
+                str(row.get('text') or row.get('diagnosis_text') or row.get('description') or row.get('name') or row.get('value') or '')
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+
+        return deduped
     
     def _create_medication_resources(self, encounter_id: int) -> List[BundleEntry]:
         """Create MedicationRequest and MedicationDispense resources."""
@@ -872,8 +1060,10 @@ class RDSManager:
             'encounters': set(),
             'vitals': set(),
             'prescriptions': set(),
-            'users': set()
+            'users': set(),
+            'mission_trips': set()
         }
+        self.mission_trip_id_map = {}  # Map source mission_trip_id to DB id
     
     def connect(self):
         """Establish connection to RDS."""
@@ -923,7 +1113,7 @@ class RDSManager:
             document_resources = []
             
             for entry in bundle.entry:
-                resource_type = entry.resource.resource_type
+                resource_type = getattr(entry.resource, '__resource_type__', entry.resource.__class__.__name__)
                 
                 if resource_type == "Patient":
                     patient_resource = entry.resource
@@ -943,6 +1133,15 @@ class RDSManager:
             encounter_legacy_id = self._extract_legacy_id(encounter_resource)
             
             logger.info(f"Processing bundle: Patient {patient_legacy_id}, Encounter {encounter_legacy_id}")
+            
+            # 0. UPSERT MISSION TRIPS (before encounters since encounters FK to mission_trips)
+            for mission_trip in parsed_data.get('mission_trips', []):
+                mission_trip_legacy_id = mission_trip.get('id') or mission_trip.get('legacy_id')
+                if mission_trip_legacy_id and mission_trip_legacy_id not in self.processed_records['mission_trips']:
+                    mt_db_id = self._upsert_mission_trip(cursor, mission_trip, mission_trip_legacy_id)
+                    self.mission_trip_id_map[mission_trip_legacy_id] = mt_db_id
+                    self.processed_records['mission_trips'].add(mission_trip_legacy_id)
+                    logger.info(f"Processed mission trip {mission_trip_legacy_id} -> DB ID {mt_db_id}")
             
             # 1. UPSERT PATIENT
             if patient_legacy_id and patient_legacy_id not in self.processed_records['patients']:
@@ -964,7 +1163,7 @@ class RDSManager:
                 else:
                     practitioner_db_ids[pract_legacy_id] = self._get_user_db_id(cursor, pract_legacy_id)
             
-            # 3. UPSERT ENCOUNTER
+            # 3. UPSERT ENCOUNTER (uses mission_trip_id_map populated above)
             if encounter_legacy_id and encounter_legacy_id not in self.processed_records['encounters']:
                 encounter_db_id = self._upsert_encounter(
                     cursor, encounter_resource, encounter_legacy_id,
@@ -1017,6 +1216,44 @@ class RDSManager:
                     pass
         
         return None
+    
+    def _upsert_mission_trip(self, cursor, mission_trip: Dict, legacy_id: int) -> int:
+        """Insert or update mission trip record. Handles null FK dependencies gracefully."""
+        cursor.execute("SELECT id FROM central_api_missiontrip WHERE legacy_id = %s", (legacy_id,))
+        existing = cursor.fetchone()
+        
+        # Extract mission trip fields
+        state_date = mission_trip.get('state_date') or mission_trip.get('start_date') or datetime.now().date()
+        end_date = mission_trip.get('end_date') or state_date
+        
+        # For mission_team_id and mission_city_id, try to get from data or use None (will be nullable)
+        # In a production system, you'd want to create defaults or handle these relationships carefully
+        mission_team_id = None  # Can be set from mission_trip data if available
+        mission_city_id = None  # Can be set from mission_trip data if available
+        
+        if existing:
+            cursor.execute("""
+                UPDATE central_api_missiontrip 
+                SET state_date = %s, end_date = %s
+                WHERE legacy_id = %s
+            """, (state_date, end_date, legacy_id))
+            logger.info(f"Updated existing mission trip {legacy_id}")
+            return existing['id']
+        else:
+            # Note: mission_team_id and mission_city_id may be required by schema
+            # If they are, we need to either create defaults or skip mission trip creation
+            try:
+                cursor.execute("""
+                    INSERT INTO central_api_missiontrip (
+                        legacy_id, state_date, end_date, mission_team_id, mission_city_id
+                    ) VALUES (%s, %s, %s, %s, %s)
+                """, (legacy_id, state_date, end_date, mission_team_id, mission_city_id))
+                logger.info(f"Inserted new mission trip {legacy_id}")
+                return cursor.lastrowid
+            except Exception as e:
+                logger.warning(f"Failed to insert mission trip {legacy_id}: {e}. "
+                               f"Continuing without mission trip link. Mission team/city may be required.")
+                return None
     
     def _upsert_patient(self, cursor, patient: Patient, legacy_id: int, parsed_data: Dict) -> int:
         """Insert or update patient record."""
@@ -1137,17 +1374,21 @@ class RDSManager:
         alcohol = original_encounter.get('alcohol', False) if original_encounter else False
         weeks_pregnant = original_encounter.get('weeks_pregnant') if original_encounter else None
         
+        # Map mission_trip_id from source data to DB id
+        mission_trip_id_from_source = original_encounter.get('mission_trip_id') if original_encounter else None
+        mission_trip_db_id = self.mission_trip_id_map.get(mission_trip_id_from_source) if mission_trip_id_from_source else None
+        
         if existing:
             cursor.execute("""
                 UPDATE central_api_patientencounter 
                 SET patient_id = %s, nurse_id = %s, doctor_id = %s, pharmacist_id = %s,
                     date_of_triage_visit = %s, timestamp = NOW(),
                     smoking = %s, history_of_diabetes = %s, history_of_hypertension = %s,
-                    history_of_high_cholesterol = %s, alcohol = %s, weeks_pregnant = %s
+                    history_of_high_cholesterol = %s, alcohol = %s, weeks_pregnant = %s, mission_trip_id = %s
                 WHERE legacy_id = %s
             """, (patient_db_id, nurse_id, doctor_id, pharmacist_id,
                   triage_date, smoking, diabetes, hypertension,
-                  high_cholesterol, alcohol, weeks_pregnant, legacy_id))
+                  high_cholesterol, alcohol, weeks_pregnant, mission_trip_db_id, legacy_id))
             logger.info(f"Updated existing encounter {legacy_id}")
             return existing['id']
         else:
@@ -1156,11 +1397,11 @@ class RDSManager:
                     legacy_id, patient_id, nurse_id, doctor_id, pharmacist_id,
                     date_of_triage_visit, timestamp, active,
                     smoking, history_of_diabetes, history_of_hypertension,
-                    history_of_high_cholesterol, alcohol, weeks_pregnant
-                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s)
+                    history_of_high_cholesterol, alcohol, weeks_pregnant, mission_trip_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
             """, (legacy_id, patient_db_id, nurse_id, doctor_id, pharmacist_id,
                   triage_date, True, smoking, diabetes, hypertension,
-                  high_cholesterol, alcohol, weeks_pregnant))
+                  high_cholesterol, alcohol, weeks_pregnant, mission_trip_db_id))
             logger.info(f"Inserted new encounter {legacy_id}")
             return cursor.lastrowid
     
@@ -1230,7 +1471,7 @@ class RDSManager:
     
     def _upsert_medication(self, cursor, medication, encounter_db_id: int,
                           practitioner_ids: Dict, parsed_data: Dict) -> Optional[int]:
-        if medication.resource_type != "MedicationRequest":
+        if getattr(medication, '__resource_type__', medication.__class__.__name__) != "MedicationRequest":
             return None
         
         original_rx = None
@@ -1322,6 +1563,78 @@ class RDSManager:
             return cursor.lastrowid
 
 
+def decrypt_file_if_encrypted(bucket: str, key: str, file_content: bytes, s3_object_response: Dict) -> bytes:
+    """
+    Decrypt file if it was encrypted with KMS envelope encryption.
+    
+    Encrypted files have .encrypted extension and store the encrypted data key in S3 metadata.
+    Uses KMS to decrypt the data key, then AES-256 to decrypt the file.
+    
+    Args:
+        bucket: S3 bucket name
+        key: S3 object key
+        file_content: Raw file bytes from S3
+        s3_object_response: Full S3 get_object response
+    
+    Returns:
+        Decrypted (and decompressed if .gz) file content
+    """
+    if not key.endswith('.encrypted'):
+        # File is not encrypted, return as-is
+        return file_content
+    
+    logger.info(f"File is encrypted (.encrypted extension detected): {key}")
+    
+    try:
+        # Step 1: Extract encrypted data key from S3 user metadata
+        metadata = s3_object_response.get('Metadata', {})
+        encrypted_data_key_b64 = metadata.get('x-amz-encrypted-data-key')
+        
+        if not encrypted_data_key_b64:
+            logger.error("Missing x-amz-encrypted-data-key in S3 object metadata")
+            raise ValueError("File is marked as encrypted but encrypted data key not found in metadata")
+        
+        encrypted_data_key = base64.b64decode(encrypted_data_key_b64)
+        logger.info(f"Retrieved encrypted data key ({len(encrypted_data_key)} bytes)")
+        
+        # Step 2: Use KMS to decrypt the data key
+        logger.info("Requesting KMS to decrypt data key...")
+        decrypt_response = kms.decrypt(CiphertextBlob=encrypted_data_key)
+        plaintext_data_key = decrypt_response['Plaintext']
+        logger.info(f"KMS decrypted data key ({len(plaintext_data_key)} bytes)")
+        
+        # Step 3: Decrypt file content using AES-256-ECB
+        logger.info(f"Decrypting file content ({len(file_content)} bytes)...")
+        aes = pyaes.AESModeOfOperationECB(plaintext_data_key)
+        decrypted_blocks = []
+        for i in range(0, len(file_content), 16):
+            block = file_content[i:i + 16]
+            if len(block) == 16:
+                decrypted_blocks.append(aes.decrypt(block))
+        decrypted_content = b"".join(decrypted_blocks)
+
+        # Remove PKCS7 padding used by Java AES encryption
+        if decrypted_content:
+            pad_len = decrypted_content[-1]
+            if 1 <= pad_len <= 16:
+                decrypted_content = decrypted_content[:-pad_len]
+
+        logger.info(f"Decrypted to {len(decrypted_content)} bytes")
+        
+        # Step 4: Handle decompression if needed (content may have been gzipped before encryption)
+        # Check if the decrypted content is gzip-compressed (magic bytes: 1f 8b)
+        if len(decrypted_content) > 2 and decrypted_content[0] == 0x1f and decrypted_content[1] == 0x8b:
+            logger.info("Decrypted content is gzip-compressed, decompressing...")
+            decrypted_content = gzip.decompress(decrypted_content)
+            logger.info(f"Decompressed to {len(decrypted_content)} bytes")
+        
+        return decrypted_content
+        
+    except Exception as e:
+        logger.error(f"Decryption failed: {e}", exc_info=True)
+        raise
+
+
 def lambda_handler(event, context):
     """
     Main Lambda handler.
@@ -1347,10 +1660,22 @@ def lambda_handler(event, context):
             response = s3.get_object(Bucket=bucket, Key=key)
             file_content = response['Body'].read()
             
-            if key.endswith('.gz'):
-                file_content = gzip.decompress(file_content)
+            # Step 1: Handle decryption if file is encrypted with KMS
+            file_content = decrypt_file_if_encrypted(bucket, key, file_content, response)
             
-            sql_content = file_content.decode('utf-8')
+            # Step 2: Handle gzip decompression if needed
+            if key.endswith('.gz') or key.endswith('.gz.encrypted'):
+                # For encrypted files, content may still be gzipped before encryption
+                try:
+                    file_content = gzip.decompress(file_content)
+                except Exception as e:
+                    logger.info(f"Content is not gzip-compressed (or already decompressed by decrypt function): {e}")
+            
+            try:
+                sql_content = file_content.decode('utf-8')
+            except UnicodeDecodeError:
+                logger.warning("SQL dump is not valid UTF-8; falling back to latin-1 decoding")
+                sql_content = file_content.decode('latin-1')
             
             parser = SQLParser(sql_content)
             parsed_data = parser.parse()

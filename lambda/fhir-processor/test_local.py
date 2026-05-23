@@ -746,6 +746,25 @@ class TestFHIRFormatting(unittest.TestCase):
         types = get_resource_types(self.b0)
         self.assertIn('MedicationRequest', types)
 
+    # ── Clinical Findings / Conditions ─────────────────────────────────────
+
+    def test_condition_resource_present(self):
+        """Clinical findings should be represented as Condition resources."""
+        types = get_resource_types(self.b0)
+        self.assertIn('Condition', types)
+
+    def test_condition_has_subject_and_encounter(self):
+        cond = next(e.resource for e in self.b0.entry
+                    if e.resource.get_resource_type() == 'Condition')
+        self.assertIn('urn:uuid:patient-', cond.subject.reference)
+        self.assertIn('urn:uuid:encounter-', cond.encounter.reference)
+
+    def test_condition_contains_diagnosis_text(self):
+        conditions = [e.resource for e in self.b0.entry
+                      if e.resource.get_resource_type() == 'Condition']
+        condition_texts = [c.code.text for c in conditions if c.code and c.code.text]
+        self.assertTrue(condition_texts, 'Expected at least one Condition with code.text')
+
     def test_observation_category_vital_signs(self):
         """All vital observations should be categorised as vital-signs."""
         for entry in self.b0.entry:
